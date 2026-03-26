@@ -496,6 +496,14 @@ public class TileMatrix {
     public void saveQuantizedMeshes(List<TerrainMesh> separatedMeshes) throws IOException {
         boolean originIsLeftUp = this.manager.isOriginIsLeftUp();
         boolean calculateNormals = globalOptions.isCalculateNormalsExtension();
+        boolean useWaterMask = globalOptions.isWaterMaskExtension();
+
+        // 初始化水面掩码管理器
+        WaterMaskManager waterMaskManager = null;
+        if (useWaterMask && globalOptions.getWaterMaskPath() != null) {
+            waterMaskManager = new WaterMaskManager();
+            waterMaskManager.loadWaterMask(globalOptions.getWaterMaskPath());
+        }
 
         for (TerrainMesh mesh : separatedMeshes) {
             TerrainTriangle triangle = mesh.triangles.get(0); // take the first triangle
@@ -508,7 +516,7 @@ public class TileMatrix {
             tile.setMesh(mesh);
 
             QuantizedMeshManager quantizedMeshManager = new QuantizedMeshManager();
-            QuantizedMesh quantizedMesh = quantizedMeshManager.getQuantizedMeshFromTile(tile, calculateNormals);
+            QuantizedMesh quantizedMesh = quantizedMeshManager.getQuantizedMeshFromTile(tile, calculateNormals, waterMaskManager);
             String tileFullPath = this.manager.getQuantizedMeshTilePath(tileIndices);
             String tileFolderPath = this.manager.getQuantizedMeshTileFolderPath(tileIndices);
             FileUtils.createAllFoldersIfNoExist(tileFolderPath);

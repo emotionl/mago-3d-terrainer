@@ -73,6 +73,7 @@ public class GlobalOptions {
     private boolean isCalculateNormalsExtension;
     private boolean isMetaDataExtension;
     private boolean isWaterMaskExtension;
+    private String waterMaskPath;
 
     // Migration options
     private int mosaicSize;
@@ -290,6 +291,9 @@ public class GlobalOptions {
         instance.setCalculateNormalsExtension(command.hasOption(CommandOptions.EXT_CALCULATE_NORMALS.getLongName()));
         instance.setMetaDataExtension(command.hasOption(CommandOptions.EXT_META_DATA.getLongName()));
         instance.setWaterMaskExtension(command.hasOption(CommandOptions.EXT_WATER_MASK.getLongName()));
+        if (command.hasOption(CommandOptions.EXT_WATER_MASK_PATH.getLongName())) {
+            instance.setWaterMaskPath(command.getOptionValue(CommandOptions.EXT_WATER_MASK_PATH.getLongName()));
+        }
         printGlobalOptions();
     }
 

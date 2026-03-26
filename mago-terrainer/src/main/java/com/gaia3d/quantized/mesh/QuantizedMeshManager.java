@@ -5,6 +5,8 @@ import com.gaia3d.terrain.structure.*;
 import com.gaia3d.terrain.tile.TileIndices;
 import com.gaia3d.terrain.tile.TileWgs84;
 import com.gaia3d.terrain.tile.TileWgs84Manager;
+import com.gaia3d.terrain.tile.WaterMaskManager;
+import com.gaia3d.terrain.types.WaterMaskType;
 import com.gaia3d.terrain.util.OctNormalFactory;
 import com.gaia3d.terrain.util.TileWgs84Utils;
 import com.gaia3d.util.GlobeUtils;
@@ -183,7 +185,8 @@ public class QuantizedMeshManager {
         return resultTile;
     }
 
-    public QuantizedMesh getQuantizedMeshFromTile(TileWgs84 tile, boolean calculateNormals) {
+    public QuantizedMesh getQuantizedMeshFromTile(TileWgs84 tile, boolean calculateNormals,
+                                                WaterMaskManager waterMaskManager) {
         // First get the quantized mesh header
         QuantizedMeshHeader header = new QuantizedMeshHeader();
         TerrainMesh mesh = tile.getMesh();
@@ -330,6 +333,24 @@ public class QuantizedMeshManager {
         for (int i = 0; i < northVerticesCount; i++) {
             int[] northIndices = quantizedMesh.getNorthIndices();
             northIndices[i] = northVertices.get(i).getId();
+        }
+
+        // ========== Water Mask处理 ==========
+        if (waterMaskManager != null && waterMaskManager.isLoaded()) {
+            GeographicExtension geoExt = tile.getGeographicExtension();
+            double minLon = geoExt.getMinLongitudeDeg();
+            double minLat = geoExt.getMinLatitudeDeg();
+            double maxLon = geoExt.getMaxLongitudeDeg();
+            double maxLat = geoExt.getMaxLatitudeDeg();
+
+            WaterMaskType type = waterMaskManager.getWaterMaskType(minLon, minLat, maxLon, maxLat);
+
+            if (type == WaterMaskType.MIXED) {
+                byte[] grid = waterMaskManager.generateWaterMaskGrid(minLon, minLat, maxLon, maxLat);
+                quantizedMesh.setWaterMaskData(type, grid);
+            } else {
+                quantizedMesh.setWaterMaskData(type, null);
+            }
         }
 
         // check if save normals

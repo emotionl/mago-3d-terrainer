@@ -2,6 +2,7 @@ package com.gaia3d.quantized.mesh;
 
 import com.gaia3d.io.LittleEndianDataInputStream;
 import com.gaia3d.io.LittleEndianDataOutputStream;
+import com.gaia3d.terrain.types.WaterMaskType;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
@@ -36,6 +37,11 @@ public class QuantizedMesh {
     private byte extensionId = 0;
     private int extensionLength = 0;
     private byte[] octEncodedNormals = null; // 2 bytes per normal
+
+    // water mask data
+    private WaterMaskType waterMaskType = null;
+    private byte[] waterMaskGrid = null;  // 256x256 = 65536 bytes
+    private static final byte WATER_MASK_EXTENSION_ID = 2;
 
     public short zigZagEncode(int n) {
         return (short) ((n << 1) ^ (n >> 31));
@@ -97,6 +103,20 @@ public class QuantizedMesh {
             encodedIndices[i] = (short) code;
             if (code == 0) {highest += 1;}
         }
+    }
+
+    // Water mask methods
+    public void setWaterMaskData(WaterMaskType type, byte[] grid) {
+        this.waterMaskType = type;
+        this.waterMaskGrid = grid;
+    }
+
+    public boolean hasWaterMask() {
+        return this.waterMaskType != null && this.waterMaskType != WaterMaskType.NONE;
+    }
+
+    public int getWaterMaskExtensionLength() {
+        return (waterMaskType == WaterMaskType.MIXED) ? 65536 : 1;
     }
 
     public void loadDataInputStream(LittleEndianDataInputStream dataInputStream) throws IOException {
@@ -339,6 +359,20 @@ public class QuantizedMesh {
             dataOutputStream.writeByte(extensionId);
             dataOutputStream.writeInt(extensionLength);
             dataOutputStream.write(octEncodedNormals);
+        }
+
+        // ========== Water Mask Extension (Extension ID 2) ==========
+        if (hasWaterMask()) {
+            dataOutputStream.writeByte(WATER_MASK_EXTENSION_ID); // 2
+            dataOutputStream.writeInt(getWaterMaskExtensionLength());
+
+            if (waterMaskType == WaterMaskType.ALL_LAND) {
+                dataOutputStream.writeByte(0x00);
+            } else if (waterMaskType == WaterMaskType.ALL_WATER) {
+                dataOutputStream.writeByte(0xFF);
+            } else if (waterMaskType == WaterMaskType.MIXED) {
+                dataOutputStream.write(waterMaskGrid);
+            }
         }
     }
 }
