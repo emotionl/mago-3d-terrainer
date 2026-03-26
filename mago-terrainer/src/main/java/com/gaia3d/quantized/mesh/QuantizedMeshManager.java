@@ -335,7 +335,7 @@ public class QuantizedMeshManager {
             northIndices[i] = northVertices.get(i).getId();
         }
 
-        // ========== Water Mask处理 ==========
+        // Water Mask Processing
         if (waterMaskManager != null && waterMaskManager.isLoaded()) {
             GeographicExtension geoExt = tile.getGeographicExtension();
             double minLon = geoExt.getMinLongitudeDeg();
@@ -343,7 +343,7 @@ public class QuantizedMeshManager {
             double maxLon = geoExt.getMaxLongitudeDeg();
             double maxLat = geoExt.getMaxLatitudeDeg();
 
-            // 目录模式下，根据瓦片地理范围加载对应的WBM文件
+            // In directory mode, load the corresponding WBM file based on tile geographic extent.
             if (waterMaskManager.isDirectoryMode()) {
                 waterMaskManager.loadWaterMaskForTile(minLon, minLat, maxLon, maxLat);
             }

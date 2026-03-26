@@ -498,7 +498,7 @@ public class TileMatrix {
         boolean calculateNormals = globalOptions.isCalculateNormalsExtension();
         boolean useWaterMask = globalOptions.isWaterMaskExtension();
 
-        // 初始化水面掩码管理器
+        // Initialize water mask manager
         WaterMaskManager waterMaskManager = null;
         if (useWaterMask && globalOptions.getWaterMaskPath() != null) {
             waterMaskManager = new WaterMaskManager();

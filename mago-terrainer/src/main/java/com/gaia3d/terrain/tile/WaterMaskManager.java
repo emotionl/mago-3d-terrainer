@@ -14,22 +14,23 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * WaterMaskManager - 水面掩码管理器
+ * WaterMaskManager - Water mask manager for terrain tiles.
  *
- * 支持两种模式：
- * 1. 单文件模式：直接加载单个WBM文件
- * 2. 目录模式：扫描目录下所有WBM文件，按瓦片地理范围动态加载
+ * Supports two modes:
+ * 1. Single-file mode: loads a single WBM file directly.
+ * 2. Directory mode: scans all WBM files in a directory, dynamically loading
+ *    based on tile geographic extent.
  *
- * 性能优化：
- * - LRU缓存已加载的WBM数据（默认缓存8个文件）
- * - 预加载瓦片涉及的所有WBM文件
- * - 按像素采样时从已缓存数据中查询
+ * Performance optimizations:
+ * - LRU cache for loaded WBM data (default 8 files).
+ * - Preload all WBM files relevant to the current tile.
+ * - Pixel sampling queries from cached data.
  */
 @Slf4j
 @Getter
 @Setter
 public class WaterMaskManager {
-    // 单一文件模式
+    // Single-file mode
     private GaiaGeoTiffManager geoTiffManager = new GaiaGeoTiffManager();
     private ReferencedEnvelope envelope;
     private double minLon;
@@ -40,16 +41,16 @@ public class WaterMaskManager {
     private double latRange;
     private boolean isLoaded = false;
 
-    // 预加载的栅格数据（单文件模式）
+    // Preloaded raster data (single-file mode)
     private int[] waterMaskData;
     private int maskWidth;
     private int maskHeight;
 
-    // 目录模式：WBM文件映射
+    // Directory mode: WBM file map
     private boolean isDirectoryMode = false;
     private Map<String, WaterMaskFileInfo> waterMaskFileMap = new HashMap<>();
 
-    // LRU缓存：瓦片key -> WBM数据
+    // LRU cache: tile key -> WBM data
     private static final int MAX_CACHED_WBM_FILES = 8;
     private LinkedHashMap<String, WbmData> wbmCache = new LinkedHashMap<>(16, 0.75f, true) {
         @Override
@@ -58,17 +59,17 @@ public class WaterMaskManager {
         }
     };
 
-    // 当前瓦片预加载的WBM数据列表
+    // Currently preloaded WBM data list for the tile
     private List<WbmData> currentTileWbmDataList = new ArrayList<>();
 
-    // WBM文件信息
+    // WBM file information
     private static class WaterMaskFileInfo {
         String filePath;
-        int minLat;   // 纬度度数（整数）
-        int minLon;   // 经度度数（整数）
+        int minLat;   // Latitude in degrees (integer)
+        int minLon;   // Longitude in degrees (integer)
         int maxLat;
         int maxLon;
-        // 地理范围（使用文件名解析，瓦片命名是1度对齐的）
+        // Geographic extent (parsed from filename, tile naming aligned to 1 degree)
         double wbmMinLon;
         double wbmMinLat;
         double wbmMaxLon;
@@ -78,9 +79,9 @@ public class WaterMaskManager {
             this.filePath = filePath;
             this.minLat = minLat;
             this.minLon = minLon;
-            this.maxLat = minLat + 1;  // 1度瓦片
+            this.maxLat = minLat + 1;  // 1-degree tile
             this.maxLon = minLon + 1;
-            // 文件名表示的瓦片范围（闭合下界，开放上界）
+            // Tile range represented by filename (inclusive min, exclusive max)
             this.wbmMinLon = minLon;
             this.wbmMaxLon = maxLon;
             this.wbmMinLat = minLat;
@@ -97,11 +98,11 @@ public class WaterMaskManager {
         }
     }
 
-    // WBM数据（包含地理范围和栅格数据）
+    // WBM data (contains geographic extent and raster data)
     private static class WbmData {
         String filePath;
-        int minLat;   // 来自文件名
-        int minLon;   // 来自文件名
+        int minLat;   // From filename
+        int minLon;   // From filename
         int maxLat;
         int maxLon;
         double lonRange;
@@ -110,7 +111,7 @@ public class WaterMaskManager {
         int width;
         int height;
 
-        // 地理范围（闭合下界，开放上界）
+        // Geographic extent (inclusive min, exclusive max)
         double wbmMinLon;
         double wbmMaxLon;
         double wbmMinLat;
@@ -124,22 +125,22 @@ public class WaterMaskManager {
             if (!contains(lon, lat)) {
                 return false;
             }
-            // 计算归一化坐标 (0-1)
+            // Calculate normalized coordinates (0-1)
             double unitaryX = (lon - wbmMinLon) / lonRange;
             double unitaryY = 1.0 - (lat - wbmMinLat) / latRange;
-            // 计算像素坐标
+            // Calculate pixel coordinates
             int col = (int) Math.floor(unitaryX * width);
             int row = (int) Math.floor(unitaryY * height);
-            // 确保在有效范围内
+            // Clamp to valid range
             col = Math.max(0, Math.min(col, width - 1));
             row = Math.max(0, Math.min(row, height - 1));
-            // 获取值
+            // Get value
             int index = row * width + col;
             return data[index] > 0;
         }
     }
 
-    // 文件名解析模式: Copernicus_DSM_COG_10_N26_00_E115_00_WBM.tif
+    // Filename parse pattern: Copernicus_DSM_COG_10_N26_00_E115_00_WBM.tif
     private static final Pattern WBM_FILE_PATTERN = Pattern.compile(
             ".*_N(\\d+)_00_E(\\d+)_00_WBM\\.tif$",
             Pattern.CASE_INSENSITIVE);
@@ -204,7 +205,7 @@ public class WaterMaskManager {
     private void loadWaterMaskFile(String filePath) {
         this.isDirectoryMode = false;
 
-        // 先检查缓存
+        // Check cache first
         WbmData cached = wbmCache.get(filePath);
         if (cached != null) {
             this.waterMaskData = cached.data;
@@ -221,14 +222,14 @@ public class WaterMaskManager {
             return;
         }
 
-        // 从文件名解析坐标
+        // Parse coordinates from filename
         WaterMaskFileInfo info = parseWbmFileName(filePath);
         if (info == null) {
             log.warn("Cannot parse WBM filename for single file mode: {}", filePath);
             return;
         }
 
-        // 加载新文件
+        // Load new file
         org.geotools.coverage.grid.GridCoverage2D coverage = geoTiffManager.loadGeoTiffGridCoverage2D(filePath);
         org.geotools.geometry.jts.ReferencedEnvelope env = coverage.getEnvelope2D();
 
@@ -243,11 +244,11 @@ public class WaterMaskManager {
         this.maskWidth = size.x;
         this.maskHeight = size.y;
 
-        // 预加载栅格数据到内存
+        // Preload raster data into memory
         Raster raster = coverage.getRenderedImage().getData();
         this.waterMaskData = raster.getPixels(0, 0, maskWidth, maskHeight, (int[]) null);
 
-        // 加入缓存
+        // Add to cache
         WbmData wbmData = new WbmData();
         wbmData.filePath = filePath;
         wbmData.minLon = info.minLon;
@@ -270,20 +271,20 @@ public class WaterMaskManager {
     }
 
     /**
-     * 预加载瓦片涉及的所有WBM文件到currentTileWbmDataList
+     * Preloads all WBM files involved in the tile into currentTileWbmDataList.
      */
     public void loadWaterMaskForTile(double tileMinLon, double tileMinLat, double tileMaxLon, double tileMaxLat) {
         if (!this.isDirectoryMode) {
             return;
         }
 
-        // 清空当前列表
+        // Clear current list
         currentTileWbmDataList.clear();
 
-        // 查找所有与瓦片范围相交的WBM文件
+        // Find all WBM files intersecting with tile extent
         for (WaterMaskFileInfo info : this.waterMaskFileMap.values()) {
             if (info.intersects(tileMinLon, tileMinLat, tileMaxLon, tileMaxLat)) {
-                // 加载或从缓存获取WBM数据
+                // Load or get WBM data from cache
                 WbmData wbmData = loadOrGetFromCache(info.filePath);
                 if (wbmData != null) {
                     currentTileWbmDataList.add(wbmData);
@@ -296,19 +297,19 @@ public class WaterMaskManager {
     }
 
     private WbmData loadOrGetFromCache(String filePath) {
-        // 先检查缓存
+        // Check cache first
         WbmData cached = wbmCache.get(filePath);
         if (cached != null) {
             return cached;
         }
 
-        // 从文件名解析坐标
+        // Parse coordinates from filename
         WaterMaskFileInfo info = parseWbmFileName(filePath);
         if (info == null) {
             return null;
         }
 
-        // 加载新文件
+        // Load new file
         org.geotools.coverage.grid.GridCoverage2D coverage = geoTiffManager.loadGeoTiffGridCoverage2D(filePath);
         org.geotools.geometry.jts.ReferencedEnvelope env = coverage.getEnvelope2D();
 
@@ -322,12 +323,12 @@ public class WaterMaskManager {
         wbmData.minLat = info.minLat;
         wbmData.maxLon = info.maxLon;
         wbmData.maxLat = info.maxLat;
-        // 使用文件名解析的坐标（1度瓦片对齐）
+        // Use coordinates parsed from filename (1-degree tile alignment)
         wbmData.wbmMinLon = info.wbmMinLon;
         wbmData.wbmMaxLon = info.wbmMaxLon;
         wbmData.wbmMinLat = info.wbmMinLat;
         wbmData.wbmMaxLat = info.wbmMaxLat;
-        // 使用GeoTIFF envelope计算像素范围比例
+        // Use GeoTIFF envelope to calculate pixel range ratio
         wbmData.lonRange = env.getMaxX() - env.getMinX();
         wbmData.latRange = env.getMaxY() - env.getMinY();
         wbmData.data = data;
@@ -347,7 +348,7 @@ public class WaterMaskManager {
         }
 
         if (this.isDirectoryMode) {
-            // 目录模式：从当前瓦片的WBM数据列表中查找
+            // Directory mode: search from current tile's WBM data list
             for (WbmData wbmData : currentTileWbmDataList) {
                 if (wbmData.contains(lonDeg, latDeg)) {
                     return wbmData.isWater(lonDeg, latDeg);
@@ -355,7 +356,7 @@ public class WaterMaskManager {
             }
             return false;
         } else {
-            // 单文件模式：使用已加载的数据
+            // Single-file mode: use loaded data
             if (waterMaskData == null) {
                 return false;
             }
@@ -387,7 +388,7 @@ public class WaterMaskManager {
         boolean hasLand = false;
         boolean hasWater = false;
 
-        // 采样检测（步长64，约400个采样点）
+        // Sampling check (step 64, approximately 400 sample points)
         int sampleStep = 64;
         for (int y = 0; y <= sampleStep && (!hasLand || !hasWater); y++) {
             for (int x = 0; x <= sampleStep && (!hasLand || !hasWater); x++) {
@@ -407,16 +408,16 @@ public class WaterMaskManager {
     }
 
     /**
-     * 生成256×256水面掩码网格
-     * 按从北向南、从西向东排列（Cesium规范要求）
+     * Generates a 256x256 water mask grid.
+     * Ordered from north to south, west to east (Cesium spec requirement).
      */
     public byte[] generateWaterMaskGrid(double minLon, double minLat, double maxLon, double maxLat) {
         byte[] grid = new byte[256 * 256];
         for (int y = 0; y < 256; y++) {
             for (int x = 0; x < 256; x++) {
-                // y=0 是最北边，y=255 是最南边
+                // y=0 is northmost, y=255 is southmost
                 double lat = maxLat - ((double) y / 255.0) * (maxLat - minLat);
-                // x=0 是最西边，x=255 是最东边
+                // x=0 is westmost, x=255 is eastmost
                 double lon = minLon + ((double) x / 255.0) * (maxLon - minLon);
                 grid[y * 256 + x] = isWater(lon, lat) ? (byte) 255 : (byte) 0;
             }

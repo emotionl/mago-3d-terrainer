@@ -361,7 +361,7 @@ public class QuantizedMesh {
             dataOutputStream.write(octEncodedNormals);
         }
 
-        // ========== Water Mask Extension (Extension ID 2) ==========
+        // Water Mask Extension (Extension ID 2)
         if (hasWaterMask()) {
             dataOutputStream.writeByte(WATER_MASK_EXTENSION_ID); // 2
             dataOutputStream.writeInt(getWaterMaskExtensionLength());
