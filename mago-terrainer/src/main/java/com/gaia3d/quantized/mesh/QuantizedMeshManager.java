@@ -343,6 +343,11 @@ public class QuantizedMeshManager {
             double maxLon = geoExt.getMaxLongitudeDeg();
             double maxLat = geoExt.getMaxLatitudeDeg();
 
+            // 目录模式下，根据瓦片地理范围加载对应的WBM文件
+            if (waterMaskManager.isDirectoryMode()) {
+                waterMaskManager.loadWaterMaskForTile(minLon, minLat, maxLon, maxLat);
+            }
+
             WaterMaskType type = waterMaskManager.getWaterMaskType(minLon, minLat, maxLon, maxLat);
 
             if (type == WaterMaskType.MIXED) {
