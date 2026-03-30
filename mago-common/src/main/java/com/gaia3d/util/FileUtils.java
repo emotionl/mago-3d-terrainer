@@ -21,7 +21,10 @@ public class FileUtils {
             return;
         } else {
             if (!file.mkdirs()) {
-                throw new RuntimeException("Failed to create folder: " + filePath);
+                // Concurrent threads may have created the directory already
+                if (!file.exists() || !file.isDirectory()) {
+                    throw new RuntimeException("Failed to create folder: " + filePath);
+                }
             }
         }
     }

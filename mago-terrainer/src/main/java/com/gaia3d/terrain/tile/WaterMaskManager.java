@@ -1,5 +1,6 @@
 package com.gaia3d.terrain.tile;
 
+import com.gaia3d.command.GlobalOptions;
 import com.gaia3d.terrain.tile.geotiff.GaiaGeoTiffManager;
 import com.gaia3d.terrain.types.WaterMaskType;
 import lombok.Getter;
@@ -42,7 +43,7 @@ public class WaterMaskManager {
     private boolean isLoaded = false;
 
     // Preloaded raster data (single-file mode)
-    private int[] waterMaskData;
+    private byte[] waterMaskData;
     private int maskWidth;
     private int maskHeight;
 
@@ -51,16 +52,21 @@ public class WaterMaskManager {
     private Map<String, WaterMaskFileInfo> waterMaskFileMap = new HashMap<>();
 
     // LRU cache: tile key -> WBM data
-    private static final int MAX_CACHED_WBM_FILES = 8;
-    private LinkedHashMap<String, WbmData> wbmCache = new LinkedHashMap<>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, WbmData> eldest) {
-            return size() > MAX_CACHED_WBM_FILES;
-        }
-    };
+    private final int maxCachedWbmFiles;
+    private LinkedHashMap<String, WbmData> wbmCache;
 
-    // Currently preloaded WBM data list for the tile
-    private List<WbmData> currentTileWbmDataList = new ArrayList<>();
+    public WaterMaskManager() {
+        this.maxCachedWbmFiles = GlobalOptions.getInstance().getWbmCacheSize();
+        this.wbmCache = new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, WbmData> eldest) {
+                return size() > maxCachedWbmFiles;
+            }
+        };
+    }
+
+    // Currently preloaded WBM data list for the tile (ThreadLocal for thread safety)
+    private final ThreadLocal<List<WbmData>> currentTileWbmDataList = ThreadLocal.withInitial(ArrayList::new);
 
     // WBM file information
     private static class WaterMaskFileInfo {
@@ -107,7 +113,7 @@ public class WaterMaskManager {
         int maxLon;
         double lonRange;
         double latRange;
-        int[] data;
+        byte[] data;
         int width;
         int height;
 
@@ -136,7 +142,7 @@ public class WaterMaskManager {
             row = Math.max(0, Math.min(row, height - 1));
             // Get value
             int index = row * width + col;
-            return data[index] > 0;
+            return data[index] != 0;
         }
     }
 
@@ -144,6 +150,19 @@ public class WaterMaskManager {
     private static final Pattern WBM_FILE_PATTERN = Pattern.compile(
             ".*_N(\\d+)_00_E(\\d+)_00_WBM\\.tif$",
             Pattern.CASE_INSENSITIVE);
+
+    /**
+     * Extracts raster data as a compact byte[] (1 byte per pixel).
+     * WBM data is binary (water/land), so int[] (4 bytes/pixel) is wasteful.
+     */
+    private static byte[] extractByteData(Raster raster, int width, int height) {
+        int[] intData = raster.getPixels(0, 0, width, height, (int[]) null);
+        byte[] byteData = new byte[intData.length];
+        for (int i = 0; i < intData.length; i++) {
+            byteData[i] = intData[i] > 0 ? (byte) 1 : (byte) 0;
+        }
+        return byteData;
+    }
 
     public void loadWaterMask(String filePath) {
         if (filePath == null || filePath.isEmpty()) {
@@ -246,7 +265,10 @@ public class WaterMaskManager {
 
         // Preload raster data into memory
         Raster raster = coverage.getRenderedImage().getData();
-        this.waterMaskData = raster.getPixels(0, 0, maskWidth, maskHeight, (int[]) null);
+        this.waterMaskData = extractByteData(raster, maskWidth, maskHeight);
+
+        // Dispose coverage after extracting pixel data to avoid holding duplicate copies
+        geoTiffManager.disposeCoverage(filePath);
 
         // Add to cache
         WbmData wbmData = new WbmData();
@@ -271,15 +293,15 @@ public class WaterMaskManager {
     }
 
     /**
-     * Preloads all WBM files involved in the tile into currentTileWbmDataList.
+     * Preloads all WBM files involved in the tile and returns the list.
+     * Thread-safe: returns a new list per call instead of mutating shared state.
      */
-    public void loadWaterMaskForTile(double tileMinLon, double tileMinLat, double tileMaxLon, double tileMaxLat) {
+    public List<WbmData> loadWaterMaskForTile(double tileMinLon, double tileMinLat, double tileMaxLon, double tileMaxLat) {
         if (!this.isDirectoryMode) {
-            return;
+            return Collections.emptyList();
         }
 
-        // Clear current list
-        currentTileWbmDataList.clear();
+        List<WbmData> wbmDataList = new ArrayList<>();
 
         // Find all WBM files intersecting with tile extent
         for (WaterMaskFileInfo info : this.waterMaskFileMap.values()) {
@@ -287,16 +309,20 @@ public class WaterMaskManager {
                 // Load or get WBM data from cache
                 WbmData wbmData = loadOrGetFromCache(info.filePath);
                 if (wbmData != null) {
-                    currentTileWbmDataList.add(wbmData);
+                    wbmDataList.add(wbmData);
                 }
             }
         }
 
+        // Also update the thread-local for backward compatibility
+        this.currentTileWbmDataList.set(wbmDataList);
+
         log.debug("Preloaded {} WBM files for tile (lat[{},{}], lon[{},{}])",
-            currentTileWbmDataList.size(), tileMinLat, tileMaxLat, tileMinLon, tileMaxLon);
+            wbmDataList.size(), tileMinLat, tileMaxLat, tileMinLon, tileMaxLon);
+        return wbmDataList;
     }
 
-    private WbmData loadOrGetFromCache(String filePath) {
+    private synchronized WbmData loadOrGetFromCache(String filePath) {
         // Check cache first
         WbmData cached = wbmCache.get(filePath);
         if (cached != null) {
@@ -315,7 +341,10 @@ public class WaterMaskManager {
 
         org.joml.Vector2i size = geoTiffManager.getGridCoverage2DSize(filePath);
         Raster raster = coverage.getRenderedImage().getData();
-        int[] data = raster.getPixels(0, 0, size.x, size.y, (int[]) null);
+        byte[] data = extractByteData(raster, size.x, size.y);
+
+        // Dispose coverage after extracting pixel data to avoid holding duplicate copies
+        geoTiffManager.disposeCoverage(filePath);
 
         WbmData wbmData = new WbmData();
         wbmData.filePath = filePath;
@@ -349,7 +378,7 @@ public class WaterMaskManager {
 
         if (this.isDirectoryMode) {
             // Directory mode: search from current tile's WBM data list
-            for (WbmData wbmData : currentTileWbmDataList) {
+            for (WbmData wbmData : currentTileWbmDataList.get()) {
                 if (wbmData.contains(lonDeg, latDeg)) {
                     return wbmData.isWater(lonDeg, latDeg);
                 }
@@ -372,7 +401,7 @@ public class WaterMaskManager {
                 col = Math.max(0, Math.min(col, maskWidth - 1));
                 row = Math.max(0, Math.min(row, maskHeight - 1));
                 int index = row * maskWidth + col;
-                return waterMaskData[index] > 0;
+                return waterMaskData[index] != 0;
             } catch (Exception e) {
                 log.debug("Error evaluating water mask at ({}, {}): {}", lonDeg, latDeg, e.getMessage());
             }
@@ -408,6 +437,70 @@ public class WaterMaskManager {
     }
 
     /**
+     * Thread-safe version: checks if a point is water using the given WBM data list.
+     */
+    public boolean isWater(double lonDeg, double latDeg, List<WbmData> wbmDataList) {
+        if (!isLoaded) {
+            return false;
+        }
+
+        if (this.isDirectoryMode) {
+            for (WbmData wbmData : wbmDataList) {
+                if (wbmData.contains(lonDeg, latDeg)) {
+                    return wbmData.isWater(lonDeg, latDeg);
+                }
+            }
+            return false;
+        } else {
+            return isWater(lonDeg, latDeg);
+        }
+    }
+
+    /**
+     * Thread-safe version: determines water mask type using the given WBM data list.
+     */
+    public WaterMaskType getWaterMaskType(double minLon, double minLat, double maxLon, double maxLat, List<WbmData> wbmDataList) {
+        if (!isLoaded) {
+            return WaterMaskType.NONE;
+        }
+
+        boolean hasLand = false;
+        boolean hasWater = false;
+
+        int sampleStep = 64;
+        for (int y = 0; y <= sampleStep && (!hasLand || !hasWater); y++) {
+            for (int x = 0; x <= sampleStep && (!hasLand || !hasWater); x++) {
+                double lat = minLat + (maxLat - minLat) * y / sampleStep;
+                double lon = minLon + (maxLon - minLon) * x / sampleStep;
+                if (isWater(lon, lat, wbmDataList)) {
+                    hasWater = true;
+                } else {
+                    hasLand = true;
+                }
+            }
+        }
+
+        if (hasWater && hasLand) return WaterMaskType.MIXED;
+        else if (hasWater) return WaterMaskType.ALL_WATER;
+        else return WaterMaskType.ALL_LAND;
+    }
+
+    /**
+     * Thread-safe version: generates a 256x256 water mask grid using the given WBM data list.
+     */
+    public byte[] generateWaterMaskGrid(double minLon, double minLat, double maxLon, double maxLat, List<WbmData> wbmDataList) {
+        byte[] grid = new byte[256 * 256];
+        for (int y = 0; y < 256; y++) {
+            for (int x = 0; x < 256; x++) {
+                double lat = maxLat - ((double) y / 255.0) * (maxLat - minLat);
+                double lon = minLon + ((double) x / 255.0) * (maxLon - minLon);
+                grid[y * 256 + x] = isWater(lon, lat, wbmDataList) ? (byte) 255 : (byte) 0;
+            }
+        }
+        return grid;
+    }
+
+    /**
      * Generates a 256x256 water mask grid.
      * Ordered from north to south, west to east (Cesium spec requirement).
      */
@@ -423,5 +516,16 @@ public class WaterMaskManager {
             }
         }
         return grid;
+    }
+
+    /**
+     * Clears all cached WBM data and releases resources.
+     */
+    public void clear() {
+        wbmCache.clear();
+        currentTileWbmDataList.get().clear();
+        waterMaskData = null;
+        geoTiffManager.clear();
+        isLoaded = false;
     }
 }

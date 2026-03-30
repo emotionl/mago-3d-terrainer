@@ -1,60 +1,105 @@
 package com.gaia3d.terrain.tile;
 
 import com.gaia3d.command.GlobalOptions;
-import jdk.jfr.Experimental;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
+/**
+ * Reusable thread pool for parallel terrain processing.
+ * Thread count is configurable via --threads CLI option.
+ */
 @Getter
 @Slf4j
-@Experimental
 public class GaiaThreadPool {
     private static GaiaThreadPool instance;
 
     private final ExecutorService executorService;
-    private final byte multiThreadCount;
+    private final int threadCount;
 
     public GaiaThreadPool() {
-        this.multiThreadCount = setDefaultThreadCount();
-        this.executorService = Executors.newFixedThreadPool(multiThreadCount);
+        this.threadCount = GlobalOptions.getInstance().getThreadCount();
+        this.executorService = Executors.newFixedThreadPool(threadCount);
+        log.info("Initialized thread pool with {} threads", threadCount);
     }
 
-    public static GaiaThreadPool getInstance() {
-        GaiaThreadPool.instance = new GaiaThreadPool();
+    public static synchronized GaiaThreadPool getInstance() {
+        if (GaiaThreadPool.instance == null) {
+            GaiaThreadPool.instance = new GaiaThreadPool();
+        }
         return GaiaThreadPool.instance;
     }
 
-    public void execute(List<Runnable> tasks) throws InterruptedException {
-        GlobalOptions globalOptions = GlobalOptions.getInstance();
+    /**
+     * Submits all tasks and waits for completion.
+     * Does NOT shut down the pool — can be called multiple times.
+     */
+    public <T> List<Future<T>> submitAllAndWait(List<Callable<T>> tasks) {
+        List<Future<T>> futures = new ArrayList<>(tasks.size());
         try {
-            for (Runnable task : tasks) {
-                Future<?> future = executorService.submit(task);
-                if (globalOptions.isDebugMode()) {
-                    future.get();
-                }
+            for (Callable<T> task : tasks) {
+                futures.add(executorService.submit(task));
             }
-        } catch (Exception e) {
-            log.error("Failed to execute thread.", e);
-            throw new RuntimeException(e);
+            for (Future<T> future : futures) {
+                future.get();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Thread pool interrupted", e);
+        } catch (ExecutionException e) {
+            log.error("Task execution failed", e.getCause());
+            throw new RuntimeException(e.getCause());
         }
-        executorService.shutdown();
-        do {
-            if (executorService.isTerminated()) {
-                executorService.shutdownNow();
-            }
-        } while (!executorService.awaitTermination(2, TimeUnit.SECONDS));
+        return futures;
     }
 
-    private byte setDefaultThreadCount() {
-        // Get the number of processors available to the Java virtual machine.
-        int processorCount = Runtime.getRuntime().availableProcessors();
-        int threadCount = processorCount > 1 ? processorCount / 2 : 1;
-        return (byte) threadCount;
+    /**
+     * Submits all Runnable tasks and waits for completion.
+     */
+    public void submitRunnablesAndWait(List<Runnable> tasks) {
+        List<Callable<Void>> callableTasks = new ArrayList<>(tasks.size());
+        for (Runnable task : tasks) {
+            callableTasks.add(() -> {
+                task.run();
+                return null;
+            });
+        }
+        submitAllAndWait(callableTasks);
+    }
+
+    /**
+     * Shuts down the thread pool. Call when all processing is complete.
+     */
+    public void shutdown() {
+        executorService.shutdown();
+        try {
+            if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+                executorService.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executorService.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        log.info("Thread pool shut down");
+    }
+
+    /**
+     * Returns the thread count configured for this pool.
+     */
+    public int getThreadCount() {
+        return threadCount;
+    }
+
+    /**
+     * Resets the singleton instance. For testing purposes.
+     */
+    public static synchronized void reset() {
+        if (instance != null) {
+            instance.shutdown();
+            instance = null;
+        }
     }
 }

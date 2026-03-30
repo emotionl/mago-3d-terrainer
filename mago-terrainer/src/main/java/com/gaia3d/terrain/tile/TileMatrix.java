@@ -498,35 +498,43 @@ public class TileMatrix {
         boolean calculateNormals = globalOptions.isCalculateNormalsExtension();
         boolean useWaterMask = globalOptions.isWaterMaskExtension();
 
-        // Initialize water mask manager
-        WaterMaskManager waterMaskManager = null;
+        // Initialize water mask manager (reuse shared instance)
+        final WaterMaskManager waterMaskManager;
         if (useWaterMask && globalOptions.getWaterMaskPath() != null) {
-            waterMaskManager = new WaterMaskManager();
-            waterMaskManager.loadWaterMask(globalOptions.getWaterMaskPath());
+            waterMaskManager = this.manager.getOrCreateWaterMaskManager();
+        } else {
+            waterMaskManager = null;
         }
 
+        // Note: multi-threaded saveQuantizedMesh causes data corruption (black stripes).
+        // Keeping single-threaded until thread safety in QuantizedMeshManager is resolved.
         for (TerrainMesh mesh : separatedMeshes) {
-            TerrainTriangle triangle = mesh.triangles.get(0); // take the first triangle
-            TileIndices tileIndices = triangle.getOwnerTileIndices();
-
-            TileWgs84 tile = new TileWgs84(null, this.manager);
-            tile.setTileIndices(tileIndices);
-            String imageryType = this.manager.getImaginaryType();
-            tile.setGeographicExtension(TileWgs84Utils.getGeographicExtentOfTileLXY(tileIndices.getL(), tileIndices.getX(), tileIndices.getY(), null, imageryType, originIsLeftUp));
-            tile.setMesh(mesh);
-
-            QuantizedMeshManager quantizedMeshManager = new QuantizedMeshManager();
-            QuantizedMesh quantizedMesh = quantizedMeshManager.getQuantizedMeshFromTile(tile, calculateNormals, waterMaskManager);
-            String tileFullPath = this.manager.getQuantizedMeshTilePath(tileIndices);
-            String tileFolderPath = this.manager.getQuantizedMeshTileFolderPath(tileIndices);
-            FileUtils.createAllFoldersIfNoExist(tileFolderPath);
-
-            LittleEndianDataOutputStream dataOutputStream = new LittleEndianDataOutputStream(new BufferedOutputStream(new FileOutputStream(tileFullPath)));
-
-            // save the tile
-            quantizedMesh.saveDataOutputStream(dataOutputStream, calculateNormals);
-            dataOutputStream.close();
+            saveQuantizedMesh(mesh, originIsLeftUp, calculateNormals, waterMaskManager);
         }
+    }
+
+    private void saveQuantizedMesh(TerrainMesh mesh, boolean originIsLeftUp, boolean calculateNormals,
+                                    WaterMaskManager waterMaskManager) throws IOException {
+        TerrainTriangle triangle = mesh.triangles.get(0); // take the first triangle
+        TileIndices tileIndices = triangle.getOwnerTileIndices();
+
+        TileWgs84 tile = new TileWgs84(null, this.manager);
+        tile.setTileIndices(tileIndices);
+        String imageryType = this.manager.getImaginaryType();
+        tile.setGeographicExtension(TileWgs84Utils.getGeographicExtentOfTileLXY(tileIndices.getL(), tileIndices.getX(), tileIndices.getY(), null, imageryType, originIsLeftUp));
+        tile.setMesh(mesh);
+
+        QuantizedMeshManager quantizedMeshManager = new QuantizedMeshManager();
+        QuantizedMesh quantizedMesh = quantizedMeshManager.getQuantizedMeshFromTile(tile, calculateNormals, waterMaskManager);
+        String tileFullPath = this.manager.getQuantizedMeshTilePath(tileIndices);
+        String tileFolderPath = this.manager.getQuantizedMeshTileFolderPath(tileIndices);
+        FileUtils.createAllFoldersIfNoExist(tileFolderPath);
+
+        LittleEndianDataOutputStream dataOutputStream = new LittleEndianDataOutputStream(new BufferedOutputStream(new FileOutputStream(tileFullPath)));
+
+        // save the tile
+        quantizedMesh.saveDataOutputStream(dataOutputStream, calculateNormals);
+        dataOutputStream.close();
     }
 
     public boolean saveSeparatedTiles(List<TerrainMesh> separatedMeshes) {

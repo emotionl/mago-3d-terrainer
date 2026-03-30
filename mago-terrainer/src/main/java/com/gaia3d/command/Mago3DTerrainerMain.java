@@ -1,6 +1,7 @@
 package com.gaia3d.command;
 
 
+import com.gaia3d.terrain.tile.GaiaThreadPool;
 import com.gaia3d.terrain.tile.TerrainElevationDataManager;
 import com.gaia3d.terrain.tile.TerrainLayer;
 import com.gaia3d.terrain.tile.TileWgs84Manager;
@@ -91,8 +92,14 @@ public class Mago3DTerrainerMain {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+        // Shutdown thread pool to allow JVM to exit
+        try {
+            GaiaThreadPool.getInstance().shutdown();
+        } catch (Exception ignored) {}
         printEnd();
         LoggingConfiguration.destroyLogger();
+        // Force exit: GeoTools/HSQL EPSG database creates non-daemon threads that prevent JVM shutdown
+        System.exit(0);
     }
 
     /**

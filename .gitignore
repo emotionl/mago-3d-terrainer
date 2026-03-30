@@ -43,3 +43,6 @@ bin/
 .DS_Store
 Cigolle2014Vector.pdf
 terrainer/gradle.properties
+
+input
+output

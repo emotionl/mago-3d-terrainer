@@ -69,6 +69,9 @@ public class TileWgs84Manager {
 
     private GaiaGeoTiffManager gaiaGeoTiffManager = new GaiaGeoTiffManager();
 
+    // Shared WaterMaskManager, reused across tile ranges within a depth level
+    private WaterMaskManager sharedWaterMaskManager = null;
+
     // the list of standardized geotiff files. This the real input for the terrain elevation data
     private List<File> standardizedGeoTiffFiles = new ArrayList<>();
 
@@ -115,6 +118,30 @@ public class TileWgs84Manager {
             double tileSizeMeters = TileWgs84Utils.getTileSizeInMetersByDepth(depth);
             double desiredPixelSizeXinMeters = tileSizeMeters / 256.0;
             this.depthDesiredPixelSizeXinMetersMap.put(depth, desiredPixelSizeXinMeters);
+        }
+    }
+
+    /**
+     * Gets or creates the shared WaterMaskManager.
+     * Reused across tile ranges within a depth level to preserve LRU cache.
+     */
+    public WaterMaskManager getOrCreateWaterMaskManager() {
+        if (sharedWaterMaskManager == null && globalOptions.isWaterMaskExtension()
+                && globalOptions.getWaterMaskPath() != null) {
+            sharedWaterMaskManager = new WaterMaskManager();
+            sharedWaterMaskManager.loadWaterMask(globalOptions.getWaterMaskPath());
+        }
+        return sharedWaterMaskManager;
+    }
+
+    /**
+     * Disposes the shared WaterMaskManager and releases all cached WBM data.
+     * Should be called at the end of each depth level.
+     */
+    public void disposeWaterMaskManager() {
+        if (sharedWaterMaskManager != null) {
+            sharedWaterMaskManager.clear();
+            sharedWaterMaskManager = null;
         }
     }
 
@@ -875,6 +902,7 @@ public class TileWgs84Manager {
             this.terrainElevationDataManager.deleteGeoTiffManager();
             this.terrainElevationDataManager.deleteTileRaster();
             this.terrainElevationDataManager.deleteCoverage();
+            this.disposeWaterMaskManager();
 
             if (!GlobalOptions.getInstance().isLeaveTemp()) {
                 this.deleteTempFilesByDepth(depth);
@@ -1223,8 +1251,7 @@ public class TileWgs84Manager {
     }
 
     public void standardizeRasters(List<String> geoTiffFileNames) {
-        String tempPath = globalOptions.getStandardizeTempPath();
-        File tempFolder = new File(tempPath);
+        String tempPath = globalOptions.getStandardizeTempPath();        File tempFolder = new File(tempPath);
         if (!tempFolder.exists() && tempFolder.mkdirs()) {
             log.debug("Created standardization folder: {}", tempFolder.getAbsolutePath());
         }

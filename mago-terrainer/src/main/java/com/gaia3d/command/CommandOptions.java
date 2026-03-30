@@ -40,6 +40,8 @@ public enum CommandOptions {
     EXT_META_DATA("metadata", "md", false, "[Experimental] Generate metadata for the terrain data."),
     EXT_WATER_MASK("waterMask", "wm", false, "[Experimental] Generate water mask for the terrain data."),
     EXT_WATER_MASK_PATH("waterMaskPath", "wmp", true, "Path to water mask GeoTIFF file (0=land, 1=water)."),
+    WBM_CACHE_SIZE("wbmCacheSize", "wcs", true, "Max number of cached WBM files (default: 8)."),
+    THREADS("threads", "th", true, "Number of threads for parallel processing (default: availableProcessors/2)."),
 
     // Debug options
     DEBUG("debug", "d", false, "[DEBUG] Print more detailed logs.");

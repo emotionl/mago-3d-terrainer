@@ -74,6 +74,8 @@ public class GlobalOptions {
     private boolean isMetaDataExtension;
     private boolean isWaterMaskExtension;
     private String waterMaskPath;
+    private int wbmCacheSize = 8;
+    private int threadCount = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
 
     // Migration options
     private int mosaicSize;
@@ -293,6 +295,12 @@ public class GlobalOptions {
         instance.setWaterMaskExtension(command.hasOption(CommandOptions.EXT_WATER_MASK.getLongName()));
         if (command.hasOption(CommandOptions.EXT_WATER_MASK_PATH.getLongName())) {
             instance.setWaterMaskPath(command.getOptionValue(CommandOptions.EXT_WATER_MASK_PATH.getLongName()));
+        }
+        if (command.hasOption(CommandOptions.WBM_CACHE_SIZE.getLongName())) {
+            instance.setWbmCacheSize(Integer.parseInt(command.getOptionValue(CommandOptions.WBM_CACHE_SIZE.getLongName())));
+        }
+        if (command.hasOption(CommandOptions.THREADS.getLongName())) {
+            instance.setThreadCount(Integer.parseInt(command.getOptionValue(CommandOptions.THREADS.getLongName())));
         }
         printGlobalOptions();
     }

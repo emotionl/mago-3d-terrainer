@@ -116,6 +116,19 @@ public class GaiaGeoTiffManager {
         pathList.clear();
     }
 
+    /**
+     * Disposes a specific cached GridCoverage2D to free memory.
+     * Useful after extracting raster data when the coverage is no longer needed.
+     */
+    public void disposeCoverage(String filePath) {
+        GridCoverage2D coverage = mapPathGridCoverage2d.remove(filePath);
+        if (coverage != null) {
+            coverage.dispose(true);
+        }
+        mapPathGridCoverage2dSize.remove(filePath);
+        pathList.remove(filePath);
+    }
+
     public GridCoverage2D getResizedCoverage2D(GridCoverage2D originalCoverage, double desiredPixelSizeXinMeters, double desiredPixelSizeYinMeters) throws FactoryException {
         GridCoverage2D resizedCoverage = null;
 
