@@ -1,0 +1,9 @@
+[project]
+name = "terrain-chunker"
+version = "0.1.0"
+description = "分块处理 GeoTIFF 地形数据"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+terrain-chunker = "terrain_chunker:main"
