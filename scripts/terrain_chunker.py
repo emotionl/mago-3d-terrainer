@@ -7,7 +7,7 @@ terrain_chunker.py — 分块处理 GeoTIFF 地形数据
 
 核心原理：
   - 所有分块生成全深度 tile（不做深度过滤）
-  - 合并时：无冲突 tile 直接移动，冲突 tile（同一路径来自多个分块）通过
+  - 合并时：无冲突 tile 直接拷贝，冲突 tile（同一路径来自多个分块）通过
     quantized-mesh 二进制裁剪合并（合并顶点/三角形/边界）
   - 这样保证低深度 tile 包含完整的区域数据
 
@@ -137,59 +137,35 @@ def generate_chunks(
 
 
 # ============================================================
-# 断点续跑
+# 断点续跑（每个 chunk 独立进度文件，支持并行）
 # ============================================================
 
 
-@dataclass
-class Progress:
-    chunks: dict[str, dict] = field(default_factory=dict)
-
-    def is_completed(self, chunk_label: str) -> bool:
-        info = self.chunks.get(chunk_label)
-        return info is not None and info.get("status") == "completed"
-
-    def mark_started(self, chunk_label: str):
-        self.chunks[chunk_label] = {
-            "status": "running",
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
-    def mark_completed(self, chunk_label: str):
-        if chunk_label in self.chunks:
-            self.chunks[chunk_label]["status"] = "completed"
-            self.chunks[chunk_label]["completed_at"] = time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        else:
-            self.chunks[chunk_label] = {
-                "status": "completed",
-                "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-    def mark_failed(self, chunk_label: str, error: str):
-        if chunk_label in self.chunks:
-            self.chunks[chunk_label]["status"] = "failed"
-            self.chunks[chunk_label]["error"] = error
-        else:
-            self.chunks[chunk_label] = {"status": "failed", "error": error}
+def chunk_progress_path(work_dir: Path, chunk_label: str) -> Path:
+    """每个 chunk 的进度文件路径。"""
+    return work_dir / chunk_label / "progress.json"
 
 
-def load_progress(path: Path) -> Progress:
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            p = Progress()
-            p.chunks = data.get("chunks", {})
-            return p
-        except (json.JSONDecodeError, OSError):
-            pass
-    return Progress()
+def is_chunk_completed(work_dir: Path, chunk_label: str) -> bool:
+    path = chunk_progress_path(work_dir, chunk_label)
+    if not path.exists():
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("status") == "completed"
+    except (json.JSONDecodeError, OSError):
+        return False
 
 
-def save_progress(path: Path, progress: Progress):
-    data = {"chunks": progress.chunks}
+def mark_chunk_status(
+    work_dir: Path, chunk_label: str, status: str, **extra
+):
+    """写入 chunk 进度（单文件，原子替换）。"""
+    path = chunk_progress_path(work_dir, chunk_label)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"status": status, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    data.update(extra)
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -312,7 +288,7 @@ def run_layer_json_gen(
 
 
 # ============================================================
-# 输出合并（智能合并：无冲突直接移动，冲突 tile 做 quantized-mesh 合并）
+# 输出合并（智能合并：无冲突直接拷贝，冲突 tile 做 quantized-mesh 合并）
 # ============================================================
 
 
@@ -324,11 +300,11 @@ def smart_merge_outputs(
 
     策略：
     1. 先扫描所有分块输出，按 tile 相对路径分组
-    2. 无冲突的 tile（只有一个来源）：直接移动
+    2. 无冲突的 tile（只有一个来源）：直接拷贝
     3. 冲突的 tile（多个来源）：解码 quantized-mesh，合并顶点/三角形，重新编码
 
     Returns:
-        (直接移动数, 冲突合并数, 合并失败数)
+        (直接拷贝数, 冲突合并数, 合并失败数)
     """
     final_output.mkdir(parents=True, exist_ok=True)
 
@@ -357,7 +333,7 @@ def smart_merge_outputs(
                     rel_path = f"{depth_dir.name}/{x_dir.name}/{terrain_file.name}"
                     tile_sources[rel_path].append(terrain_file)
 
-    moved_count = 0
+    copied_count = 0
     merged_count = 0
     failed_count = 0
 
@@ -366,9 +342,9 @@ def smart_merge_outputs(
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         if len(sources) == 1:
-            # 无冲突：直接移动
-            shutil.move(str(sources[0]), str(dest))
-            moved_count += 1
+            # 无冲突：拷贝（保留源文件，支持重复跑合并）
+            shutil.copy2(str(sources[0]), str(dest))
+            copied_count += 1
         else:
             # 冲突：quantized-mesh 合并
             try:
@@ -384,15 +360,10 @@ def smart_merge_outputs(
             except Exception as e:
                 # 合并失败时，使用第一个来源的文件
                 print(f"    合并失败 {rel_path}: {e}")
-                shutil.move(str(sources[0]), str(dest))
+                shutil.copy2(str(sources[0]), str(dest))
                 failed_count += 1
 
-            # 清理源文件
-            for src in sources:
-                if src.exists():
-                    src.unlink()
-
-    return moved_count, merged_count, failed_count
+    return copied_count, merged_count, failed_count
 
 
 # ============================================================
@@ -507,9 +478,6 @@ def main():
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
 
-    progress_file = args.work_dir / "progress.json"
-    progress = load_progress(progress_file)
-
     interrupted = False
 
     def signal_handler(sig, frame):
@@ -535,7 +503,7 @@ def main():
         if interrupted:
             break
 
-        if progress.is_completed(chunk.label):
+        if is_chunk_completed(args.work_dir, chunk.label):
             print(f"\n[{chunk.index:02d}] {chunk.label} — 已完成，跳过")
             skipped += 1
             continue
@@ -552,8 +520,7 @@ def main():
         chunk_output = args.work_dir / chunk.label / "output"
         log_path = args.work_dir / chunk.label / "output.log"
 
-        progress.mark_started(chunk.label)
-        save_progress(progress_file, progress)
+        mark_chunk_status(args.work_dir, chunk.label, "running")
 
         chunk_start = time.time()
         ret = run_terrainer(
@@ -563,14 +530,12 @@ def main():
         chunk_elapsed = time.time() - chunk_start
 
         if ret == 0:
-            progress.mark_completed(chunk.label)
-            save_progress(progress_file, progress)
+            mark_chunk_status(args.work_dir, chunk.label, "completed")
             completed += 1
             print(f"  完成 ({chunk_elapsed:.1f}s)")
         else:
             error_msg = f"exit code {ret}"
-            progress.mark_failed(chunk.label, error_msg)
-            save_progress(progress_file, progress)
+            mark_chunk_status(args.work_dir, chunk.label, "failed", error=error_msg)
             failed += 1
             print(f"  失败 ({error_msg})，日志: {log_path}")
             if log_path.exists():
@@ -607,11 +572,11 @@ def main():
     # ================================================================
     print(f"\n{'=' * 60}")
     print("智能合并输出...")
-    print("  策略: 无冲突 tile 直接移动，冲突 tile 进行 quantized-mesh 合并")
+    print("  策略: 无冲突 tile 直接拷贝，冲突 tile 进行 quantized-mesh 合并")
     print("=" * 60)
 
-    moved, merged, failed = smart_merge_outputs(args.work_dir, args.output_dir)
-    print(f"  直接移动: {moved} 个")
+    copied, merged, failed = smart_merge_outputs(args.work_dir, args.output_dir)
+    print(f"  直接拷贝: {copied} 个")
     print(f"  冲突合并: {merged} 个")
     if failed > 0:
         print(f"  合并失败（使用首个来源）: {failed} 个")
