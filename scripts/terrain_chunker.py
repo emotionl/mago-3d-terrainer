@@ -562,52 +562,16 @@ def main():
         print("\n存在失败的分块，请检查日志。")
         sys.exit(1)
 
-    if args.skip_merge:
-        print(f"\n{'=' * 60}")
-        print("跳过合并，全部完成!")
-        return
-
     # ================================================================
-    # 智能合并输出
+    # 合并步骤已提取为独立脚本 merge_terrain.py
     # ================================================================
     print(f"\n{'=' * 60}")
-    print("智能合并输出...")
-    print("  策略: 无冲突 tile 直接拷贝，冲突 tile 进行 quantized-mesh 合并")
-    print("=" * 60)
-
-    copied, merged, failed = smart_merge_outputs(args.work_dir, args.output_dir)
-    print(f"  直接拷贝: {copied} 个")
-    print(f"  冲突合并: {merged} 个")
-    if failed > 0:
-        print(f"  合并失败（使用首个来源）: {failed} 个")
-
-    # 生成 layer.json
-    print("\n生成 layer.json...")
-    ret = run_layer_json_gen(
-        args.jar, args.output_dir, args.heap, extra_args=extra_args,
-    )
-    if ret == 0:
-        layer_json = args.output_dir / "layer.json"
-        if layer_json.exists():
-            with open(layer_json, "r") as f:
-                lj = json.load(f)
-            bounds = lj.get("bounds", [])
-            if bounds:
-                print(f"  bounds: [{bounds[0]:.2f}, {bounds[1]:.2f}, {bounds[2]:.2f}, {bounds[3]:.2f}]")
-            print(f"  layer.json 已生成: {layer_json}")
-    else:
-        print("  layer.json 生成失败，请手动运行:")
-        print(f"  java -jar {args.jar} -j -i {args.output_dir} -o {args.output_dir} -wm")
-
-    # 统计总 tile 数
-    total_tiles = sum(
-        1 for d in args.output_dir.iterdir()
-        if d.is_dir() and d.name.isdigit()
-        for x in d.rglob("*.terrain")
-    )
-
-    print(f"\n{'=' * 60}")
-    print(f"全部完成! 共 {total_tiles} 个 terrain 文件")
+    print("分块生成完成!")
+    print(f"请使用 merge_terrain.py 合并输出:")
+    print(f"  python scripts/merge_terrain.py \\")
+    print(f"    --chunk-work-dir {args.work_dir} \\")
+    print(f"    --output-dir {args.output_dir} \\")
+    print(f"    --jar {args.jar}")
 
 
 if __name__ == "__main__":

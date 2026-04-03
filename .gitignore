@@ -46,3 +46,5 @@ terrainer/gradle.properties
 
 input
 output
+output-*
+chunk_work

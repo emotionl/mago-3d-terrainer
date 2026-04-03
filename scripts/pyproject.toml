@@ -7,3 +7,4 @@ dependencies = []
 
 [project.scripts]
 terrain-chunker = "terrain_chunker:main"
+merge-terrain = "merge_terrain:main"
