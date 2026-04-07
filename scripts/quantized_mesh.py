@@ -255,6 +255,55 @@ def encode_tile(tile: QuantizedMeshTile) -> bytes:
     return b"".join(parts)
 
 
+WATERMASK_EXT_ID = 2
+
+
+def _merge_watermask(masks: list[bytes]) -> bytes:
+    """合并多个 water mask 扩展数据。
+
+    格式：
+      - 1 字节: 0x00=全水, 0x01=全陆
+      - 65536 字节: 256×256 mask, 每像素 0=水, 255=陆
+
+    合并策略（OR 语义：任一来源为陆地 → 陆地）:
+      - 全水 + 全水 → 全水
+      - 全陆 or 有 mask → 合并 mask（逐像素 OR）
+    """
+    if not masks:
+        return b'\x00'
+
+    # 全是单字节全水 → 全水
+    if all(len(m) == 1 and m[0] == 0 for m in masks):
+        return b'\x00'
+
+    # 收集 256x256 mask（将单字节扩展为全尺寸 mask）
+    full_masks = []
+    for m in masks:
+        if len(m) == 1:
+            full_masks.append(bytes([m[0]] * 65536))
+        elif len(m) == 65536:
+            full_masks.append(m)
+        else:
+            # 未知格式，取第一个有数据的
+            return masks[0]
+
+    # 逐像素 OR 合并
+    result = bytearray(65536)
+    for mask in full_masks:
+        for i in range(65536):
+            if mask[i]:
+                result[i] = 255
+
+    # 检查是否可以简化为单字节
+    has_water = any(b == 0 for b in result)
+    has_land = any(b > 0 for b in result)
+    if not has_land:
+        return b'\x00'
+    if not has_water:
+        return b'\x01'
+    return bytes(result)
+
+
 def merge_tiles(tiles: list[QuantizedMeshTile]) -> QuantizedMeshTile:
     """合并多个覆盖同一区域但数据来源不同的 quantized-mesh tile。
 
@@ -264,7 +313,7 @@ def merge_tiles(tiles: list[QuantizedMeshTile]) -> QuantizedMeshTile:
     3. 重算 min/max height，重新归一化 height 值
     4. 重算 bounding sphere
     5. 合并 edge indices
-    6. Extensions 取第一个非空的 tile 的数据
+    6. Water mask 扩展逐像素 OR 合并，其他扩展取第一个非空
     """
     if len(tiles) == 0:
         raise ValueError("No tiles to merge")
@@ -321,11 +370,24 @@ def merge_tiles(tiles: list[QuantizedMeshTile]) -> QuantizedMeshTile:
         for idx in tile.north_indices:
             all_north.append(idx + vertex_offset)
 
-        # Extensions: 取第一个有 extension 的 tile
-        if not merged.extensions and tile.extensions:
-            merged.extensions = tile.extensions
-
+        # 收集所有 water mask 扩展
         vertex_offset += tile.vertex_count
+
+    # 合并扩展
+    # Water mask (ext 2): 逐像素 OR 合并
+    watermasks = []
+    other_exts = []
+    for tile in tiles:
+        for ext_id, ext_data in tile.extensions:
+            if ext_id == WATERMASK_EXT_ID:
+                watermasks.append(ext_data)
+            elif not any(e[0] == ext_id for e in other_exts):
+                other_exts.append((ext_id, ext_data))
+
+    merged.extensions = list(other_exts)
+    if watermasks:
+        merged_mask = _merge_watermask(watermasks)
+        merged.extensions.insert(0, (WATERMASK_EXT_ID, merged_mask))
 
     merged.vertex_count = len(all_u)
     merged.u = all_u
