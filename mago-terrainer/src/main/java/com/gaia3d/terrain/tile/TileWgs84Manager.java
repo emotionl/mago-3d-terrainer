@@ -843,9 +843,7 @@ public class TileWgs84Manager {
         int availableMaxDepth = this.availableTileSet.getMaxAvailableDepth();
         if (maxTileDepth < 0) {
             maxTileDepth = availableMaxDepth;
-        } else if (availableMaxDepth < maxTileDepth) {
-            maxTileDepth = availableMaxDepth;
-        }
+        } 
 
         // delete available tile ranges over maxTileDepth
         this.availableTileSet.deleteTileRangesOverDepth(maxTileDepth);

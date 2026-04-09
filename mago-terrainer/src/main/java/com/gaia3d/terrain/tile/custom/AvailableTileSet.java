@@ -1,5 +1,6 @@
 package com.gaia3d.terrain.tile.custom;
 
+import com.gaia3d.command.GlobalOptions;
 import com.gaia3d.terrain.structure.GeographicExtension;
 import com.gaia3d.terrain.tile.TileIndices;
 import com.gaia3d.terrain.tile.TileRange;
@@ -24,7 +25,7 @@ public class AvailableTileSet {
     }
 
     public List<TileRange> getAvailableTileRangesAtDepth(int depth) {
-        return mapDepthAvailableTileRanges.get(depth);
+        return mapDepthAvailableTileRanges.getOrDefault(depth, java.util.Collections.emptyList());
     }
 
     public int getMaxAvailableDepth() {
@@ -36,7 +37,9 @@ public class AvailableTileSet {
     }
 
     public void addAvailableExtensions(double pixelSizeMeters, GeographicExtension extension) {
-        int maxDepth = TileWgs84Utils.getMaxTileDepthByPixelSizeMeters(pixelSizeMeters);
+        int autoMaxDepth = TileWgs84Utils.getMaxTileDepthByPixelSizeMeters(pixelSizeMeters);
+        int userMaxDepth = GlobalOptions.getInstance().getMaximumTileDepth();
+        int maxDepth = userMaxDepth > autoMaxDepth ? userMaxDepth : autoMaxDepth;
         boolean originIsLeftUp = false;
         for (int depth = 0; depth <= maxDepth; depth++) {
             List<TileRange> tileRanges = mapDepthAvailableTileRanges.computeIfAbsent(depth, k -> new java.util.ArrayList<>());
