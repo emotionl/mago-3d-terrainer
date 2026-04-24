@@ -22,12 +22,14 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import signal
 import subprocess
 import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from itertools import islice
 from pathlib import Path
 
 from quantized_mesh import decode_tile, encode_tile, merge_tiles
@@ -68,41 +70,228 @@ def _copy_tile_worker(args: tuple) -> tuple:
     src_str, dest_str = args
     dest = Path(dest_str)
     dest.parent.mkdir(parents=True, exist_ok=True)
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            shutil.copy2(src_str, dest_str)
+            return "copied", "", None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+            else:
+                return "failed", dest_str, str(e)
+
+
+def _batched(iterable, n):
+    """将可迭代对象分成大小为 n 的批次。最后一批可能不足 n 个。"""
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, n))
+        if not batch:
+            return
+        yield batch
+
+
+# ============================================================
+# 扫描分块输出（SQLite 缓存）
+# ============================================================
+
+CACHE_FILENAME = ".scan_cache.db"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tiles (
+    depth   INTEGER NOT NULL,
+    rel_path TEXT NOT NULL,
+    chunk   TEXT NOT NULL,
+    PRIMARY KEY (depth, rel_path, chunk)
+);
+CREATE INDEX IF NOT EXISTS idx_tiles_depth ON tiles(depth);
+
+CREATE TABLE IF NOT EXISTS tile_status (
+    depth    INTEGER NOT NULL,
+    rel_path TEXT NOT NULL,
+    status   TEXT NOT NULL DEFAULT 'pending',
+    PRIMARY KEY (depth, rel_path)
+);
+CREATE INDEX IF NOT EXISTS idx_status_depth ON tile_status(depth, status);
+"""
+
+
+def _init_db(db_path: Path) -> sqlite3.Connection:
+    """初始化 SQLite 数据库。"""
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_SCHEMA)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _init_tile_status(conn: sqlite3.Connection, depth: int) -> None:
+    """为指定 depth 初始化 tile_status（从 tiles 表导入，仅执行一次）。"""
+    conn.execute("""
+        INSERT OR IGNORE INTO tile_status (depth, rel_path, status)
+        SELECT DISTINCT depth, rel_path, 'pending' FROM tiles WHERE depth = ?
+    """, (depth,))
+    conn.commit()
+
+
+def _get_depth_stats(conn: sqlite3.Connection, depth: int) -> dict[str, int]:
+    """获取指定 depth 的各状态计数。"""
+    rows = conn.execute(
+        "SELECT status, COUNT(*) FROM tile_status WHERE depth = ? GROUP BY status",
+        (depth,),
+    ).fetchall()
+    stats = {"pending": 0, "completed": 0, "failed": 0}
+    for status, count in rows:
+        stats[status] = count
+    return stats
+
+
+def _get_pending_relpaths(conn: sqlite3.Connection, depth: int) -> set[str]:
+    """获取指定 depth 的 pending 状态 rel_path 集合。"""
+    rows = conn.execute(
+        "SELECT rel_path FROM tile_status WHERE depth = ? AND status = 'pending'",
+        (depth,),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def _mark_tiles(conn: sqlite3.Connection, depth: int, rel_paths: list[str], status: str) -> None:
+    """批量更新 tile 状态。"""
+    conn.executemany(
+        "UPDATE tile_status SET status = ? WHERE depth = ? AND rel_path = ?",
+        [(status, depth, p) for p in rel_paths],
+    )
+
+
+def _tile_status(conn: sqlite3.Connection, depth: int, rel_path: str) -> str | None:
+    """获取单个 tile 的状态。"""
+    row = conn.execute(
+        "SELECT status FROM tile_status WHERE depth = ? AND rel_path = ?",
+        (depth, rel_path),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _load_from_db(
+    db_path: Path,
+    skip_depths: set[int],
+    chunk_work_dir: Path,
+    logger: logging.Logger,
+) -> dict[int, dict[str, list[Path]]] | None:
+    """从 SQLite 加载扫描缓存。返回 None 表示缓存不可用。"""
+    if not db_path.exists():
+        return None
+
+    logger.info(f"加载扫描缓存: {db_path}")
     try:
-        shutil.copy2(src_str, dest_str)
-        return "copied", "", None
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        logger.warning("缓存文件损坏，将重新扫描")
+        return None
+
+    try:
+        # 统计可用 depth
+        placeholders = ",".join("?" * len(skip_depths)) if skip_depths else "0"
+        depth_rows = conn.execute(
+            f"SELECT DISTINCT depth FROM tiles WHERE depth NOT IN ({placeholders})",
+            list(skip_depths),
+        ).fetchall()
+        available_depths = [r[0] for r in depth_rows]
+
+        if not available_depths:
+            conn.close()
+            return {}
+
+        # 按 depth 加载
+        depth_tiles: dict[int, dict[str, list[Path]]] = {}
+        total_tiles = 0
+        for depth in available_depths:
+            tiles: dict[str, list[Path]] = {}
+            rows = conn.execute(
+                "SELECT rel_path, chunk FROM tiles WHERE depth = ?", (depth,)
+            ).fetchall()
+            for rel_path, chunk in rows:
+                src = chunk_work_dir / chunk / "output" / rel_path
+                if rel_path in tiles:
+                    tiles[rel_path].append(src)
+                else:
+                    tiles[rel_path] = [src]
+            depth_tiles[depth] = tiles
+            total_tiles += len(tiles)
+
+        conn.close()
+        logger.info(
+            f"缓存加载完成 — {len(available_depths)} 个 depth 层级，"
+            f"{total_tiles} 个 tile"
+        )
+        return depth_tiles
+
     except Exception as e:
-        return "failed", dest_str, str(e)
-
-
-# ============================================================
-# 扫描分块输出
-# ============================================================
+        conn.close()
+        logger.warning(f"缓存加载失败，将重新扫描: {e}")
+        return None
 
 
 def scan_chunk_outputs(
     chunk_work_dir: Path,
+    logger: logging.Logger | None = None,
+    skip_depths: set[int] | None = None,
 ) -> dict[int, dict[str, list[Path]]]:
     """扫描所有分块输出，按 depth 分组收集 tile。
+
+    Args:
+        skip_depths: 已完成的 depth 集合，扫描时跳过这些层级。
 
     Returns:
         {depth: {rel_path: [source_paths]}}
     """
+    def log_info(msg: str):
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
+
+    skip_depths = skip_depths or set()
+
+    # 尝试从 SQLite 缓存加载
+    cache_path = chunk_work_dir / CACHE_FILENAME
+    if logger:
+        cached = _load_from_db(cache_path, skip_depths, chunk_work_dir, logger)
+        if cached is not None:
+            return cached
+
+    # 缓存不可用，执行扫描（边扫描边写入 SQLite）
     depth_tiles: dict[int, dict[str, list[Path]]] = defaultdict(
         lambda: defaultdict(list)
     )
 
-    for chunk_dir in sorted(chunk_work_dir.iterdir()):
-        if not chunk_dir.is_dir() or not chunk_dir.name.startswith("chunk_"):
-            continue
+    all_entries = list(chunk_work_dir.iterdir())
+    chunk_dirs = sorted(
+        e for e in all_entries
+        if e.is_dir() and e.name.startswith("chunk_")
+    )
+    total_chunks = len(chunk_dirs)
+    log_info(f"发现 {total_chunks} 个 chunk 目录，开始扫描...")
+
+    # 初始化数据库，边扫描边写入
+    conn = _init_db(cache_path)
+    total_file_count = 0
+
+    for i, chunk_dir in enumerate(chunk_dirs, 1):
         chunk_output = chunk_dir / "output"
         if not chunk_output.exists():
             continue
 
+        chunk_batch = []
+        file_count = 0
         for depth_dir in chunk_output.iterdir():
             if not depth_dir.is_dir() or not depth_dir.name.isdigit():
                 continue
             depth = int(depth_dir.name)
+            if depth in skip_depths:
+                continue
             for x_dir in depth_dir.iterdir():
                 if not x_dir.is_dir() or not x_dir.name.isdigit():
                     continue
@@ -113,6 +302,24 @@ def scan_chunk_outputs(
                         continue
                     rel_path = f"{depth_dir.name}/{x_dir.name}/{terrain_file.name}"
                     depth_tiles[depth][rel_path].append(terrain_file)
+                    chunk_batch.append((depth, rel_path, chunk_dir.name))
+                    file_count += 1
+
+        # 每个 chunk 扫描完立即写入数据库
+        if chunk_batch:
+            conn.executemany(
+                "INSERT OR IGNORE INTO tiles (depth, rel_path, chunk) VALUES (?, ?, ?)",
+                chunk_batch,
+            )
+            conn.commit()
+        total_file_count += file_count
+
+        if i % 50 == 0 or i == total_chunks:
+            log_info(f"扫描进度: {i}/{total_chunks} chunks, 累计 {total_file_count} 个 tile")
+
+    conn.close()
+    if total_file_count:
+        log_info(f"缓存已保存 ({total_file_count} 条记录)")
 
     return dict(depth_tiles)
 
@@ -264,6 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--clean", action="store_true", help="清除输出目录重新开始")
     parser.add_argument("--skip-layer-json", action="store_true", help="跳过 layer.json 生成")
+    parser.add_argument("--rescan", action="store_true", help="强制重新扫描（忽略缓存）")
     return parser
 
 
@@ -299,9 +507,46 @@ def main():
     logger.info(f"JAR: {args.jar}")
     logger.info(f"并行 workers: {workers}")
 
+    # --rescan 清除缓存
+    if args.rescan:
+        cache_path = args.chunk_work_dir / CACHE_FILENAME
+        if cache_path.exists():
+            logger.info("--rescan: 清除扫描缓存")
+            cache_path.unlink()
+
+    # 收集已完成的 depth，扫描时跳过
+    completed_depths: set[int] = set()
+    db_path = args.chunk_work_dir / CACHE_FILENAME
+    if db_path.exists():
+        try:
+            conn_check = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            depth_rows = conn_check.execute(
+                "SELECT DISTINCT depth FROM tiles"
+            ).fetchall()
+            for (d,) in depth_rows:
+                _init_tile_status(conn_check, d)
+                stats = _get_depth_stats(conn_check, d)
+                if stats["pending"] == 0 and stats["failed"] == 0:
+                    completed_depths.add(d)
+            conn_check.close()
+        except Exception:
+            pass
+    # 兼容旧 manifest JSON
+    if args.output_dir.exists():
+        for depth in range(20):
+            m = load_manifest(args.output_dir, depth)
+            if m and m.get("status") == "completed":
+                completed_depths.add(depth)
+
+    if completed_depths:
+        logger.info(f"已完成层级: {sorted(completed_depths)}，扫描时跳过")
+
     # 扫描分块输出
     logger.info("扫描分块输出...")
-    depth_tiles = scan_chunk_outputs(args.chunk_work_dir)
+    depth_tiles = scan_chunk_outputs(
+        args.chunk_work_dir, logger,
+        skip_depths=completed_depths,
+    )
 
     if not depth_tiles:
         logger.error("未找到任何 terrain tile")
@@ -315,6 +560,9 @@ def main():
         f"共 {len(depth_tiles)} 个 depth 层级，{total_tiles} 个 tile，"
         f"{conflict_tiles} 个冲突合并"
     )
+
+    # 打开 SQLite 用于处理状态追踪
+    db_conn = _init_db(db_path)
 
     # 中断处理
     interrupted = False
@@ -341,135 +589,182 @@ def main():
             break
 
         tiles = depth_tiles[depth]
-        single_source = {p: s[0] for p, s in tiles.items() if len(s) == 1}
-        multi_source = {p: s for p, s in tiles.items() if len(s) > 1}
 
-        # 检查断点
-        manifest = load_manifest(args.output_dir, depth)
-        if manifest and manifest.get("status") == "completed":
-            skipped_c = manifest.get("copied", 0)
-            skipped_m = manifest.get("merged", 0)
-            skipped_f = manifest.get("failed", 0)
-            total_skipped += skipped_c + skipped_m + skipped_f
+        # 初始化 tile_status 并检查是否已完成
+        _init_tile_status(db_conn, depth)
+        stats = _get_depth_stats(db_conn, depth)
+
+        if stats["pending"] == 0 and stats["failed"] == 0:
+            total_skipped += stats["completed"]
             logger.info(
                 f"[depth {depth}] 已完成，跳过 "
-                f"(拷贝 {skipped_c}, 合并 {skipped_m}, 失败 {skipped_f})"
+                f"(共 {stats['completed']} 个 tile)"
             )
             continue
 
-        # 恢复已完成的 tile
-        completed_paths = set()
-        if manifest and manifest.get("status") == "in_progress":
-            completed_paths = set(manifest.get("completed_paths", []))
+        # 获取 pending 的 rel_path，过滤出待处理任务
+        pending_set = _get_pending_relpaths(db_conn, depth)
+        single_source = {p: s[0] for p, s in tiles.items() if len(s) == 1}
+        multi_source = {p: s for p, s in tiles.items() if len(s) > 1}
 
-        # 过滤已完成的 tile
-        single_tasks = {
-            p: s for p, s in single_source.items() if p not in completed_paths
-        }
-        multi_tasks = {
-            p: s for p, s in multi_source.items() if p not in completed_paths
-        }
+        single_tasks = {p: s for p, s in single_source.items() if p in pending_set}
+        multi_tasks = {p: s for p, s in multi_source.items() if p in pending_set}
 
-        new_completed = list(completed_paths)
-        depth_copied = len(completed_paths & set(single_source.keys()))
-        depth_merged = len(completed_paths & set(multi_source.keys()))
-        depth_failed = 0
+        # 统计已完成中单源/多源的数量
+        depth_merged = sum(
+            1 for p in multi_source
+            if _tile_status(db_conn, depth, p) == "completed"
+        )
+        depth_copied = stats["completed"] - depth_merged
+        depth_failed = stats["failed"]
 
+        total_pending = len(single_tasks) + len(multi_tasks)
         logger.info(
             f"[depth {depth}] 开始处理 — 共 {len(tiles)} 个 tile "
             f"(拷贝 {len(single_tasks)}, 合并 {len(multi_tasks)}, "
-            f"已完成 {len(completed_paths)})"
+            f"已完成 {stats['completed']}, 失败 {stats['failed']})"
         )
         depth_start = time.time()
 
-        # 初始化 manifest
-        if not manifest:
-            manifest = {
-                "depth": depth,
-                "status": "in_progress",
-                "total_tiles": len(tiles),
-                "copied": 0,
-                "merged": 0,
-                "failed": 0,
-                "completed_paths": [],
-                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            save_manifest(args.output_dir, depth, manifest)
+        # 保存 manifest（精简，只有元数据）
+        save_manifest(args.output_dir, depth, {
+            "depth": depth,
+            "status": "in_progress",
+            "total_tiles": len(tiles),
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
 
-        # 提交任务
-        batch_size = 500
+        # 提交任务（分批提交，避免一次性创建大量 Future 对象）
+        batch_size = 500        # 进度保存间隔
+        submit_batch = 10_000   # 每批提交的任务数
 
         with ThreadPoolExecutor(max_workers=min(16, workers * 2)) as copy_pool, \
              ProcessPoolExecutor(max_workers=workers) as merge_pool:
 
-            # 拷贝任务
-            copy_futures = {}
-            for rel_path, src in single_tasks.items():
-                dest = args.output_dir / rel_path
-                fut = copy_pool.submit(
-                    _copy_tile_worker, (str(src), str(dest))
-                )
-                copy_futures[fut] = rel_path
-
-            # 合并任务
-            merge_futures = {}
-            for rel_path, sources in multi_tasks.items():
-                fut = merge_pool.submit(
-                    _merge_tile_worker,
-                    (rel_path, [str(s) for s in sources], str(args.output_dir)),
-                )
-                merge_futures[fut] = rel_path
-
-            # 收集结果
             processed = 0
-            for fut in as_completed(
-                list(copy_futures.keys()) + list(merge_futures.keys())
-            ):
+
+            # --- 分批处理拷贝任务 ---
+            for batch in _batched(single_tasks.items(), submit_batch):
                 if interrupted:
                     break
-                try:
-                    action, rel_path, error = fut.result()
-                except Exception as e:
-                    action, rel_path, error = "failed", "", str(e)
 
-                if action == "copied":
-                    depth_copied += 1
-                elif action == "merged":
-                    depth_merged += 1
-                else:
-                    depth_failed += 1
-                    if error:
-                        logger.warning(f"合并失败 {rel_path}: {error}")
-
-                # 记录完成
-                actual_path = rel_path or copy_futures.get(fut) or merge_futures.get(fut, "")
-                if actual_path:
-                    new_completed.append(actual_path)
-
-                processed += 1
-                # 批量保存进度
-                if processed % batch_size == 0:
-                    manifest.update({
-                        "status": "in_progress",
-                        "copied": depth_copied,
-                        "merged": depth_merged,
-                        "failed": depth_failed,
-                        "completed_paths": new_completed,
-                    })
-                    save_manifest(args.output_dir, depth, manifest)
-                    logger.debug(
-                        f"[depth {depth}] 进度 {processed}/{len(single_tasks) + len(multi_tasks)}"
+                copy_futures = {}
+                for rel_path, src in batch:
+                    dest = args.output_dir / rel_path
+                    fut = copy_pool.submit(
+                        _copy_tile_worker, (str(src), str(dest))
                     )
+                    copy_futures[fut] = rel_path
 
-        # 保存最终 manifest
-        manifest.update({
-            "status": "completed",
-            "copied": depth_copied,
-            "merged": depth_merged,
-            "failed": depth_failed,
-            "completed_paths": new_completed,
+                batch_completed = []
+                batch_failed = []
+                for fut in as_completed(copy_futures):
+                    if interrupted:
+                        break
+                    try:
+                        action, rel_path, error = fut.result()
+                    except Exception as e:
+                        action, rel_path, error = "failed", "", str(e)
+
+                    actual_path = rel_path or copy_futures.get(fut, "")
+
+                    if action == "copied":
+                        depth_copied += 1
+                        batch_completed.append(actual_path)
+                    else:
+                        depth_failed += 1
+                        batch_failed.append(actual_path)
+                        if error:
+                            logger.warning(f"拷贝失败 {actual_path}: {error}")
+
+                    processed += 1
+                    if processed % batch_size == 0:
+                        _mark_tiles(db_conn, depth, batch_completed, "completed")
+                        _mark_tiles(db_conn, depth, batch_failed, "failed")
+                        db_conn.commit()
+                        batch_completed.clear()
+                        batch_failed.clear()
+                        logger.debug(
+                            f"[depth {depth}] 进度 {processed}/{total_pending}"
+                        )
+
+                # 批次结束，提交剩余
+                if batch_completed:
+                    _mark_tiles(db_conn, depth, batch_completed, "completed")
+                if batch_failed:
+                    _mark_tiles(db_conn, depth, batch_failed, "failed")
+                if batch_completed or batch_failed:
+                    db_conn.commit()
+
+            # --- 分批处理合并任务 ---
+            for batch in _batched(multi_tasks.items(), submit_batch):
+                if interrupted:
+                    break
+
+                merge_futures = {}
+                for rel_path, sources in batch:
+                    fut = merge_pool.submit(
+                        _merge_tile_worker,
+                        (rel_path, [str(s) for s in sources], str(args.output_dir)),
+                    )
+                    merge_futures[fut] = rel_path
+
+                batch_completed = []
+                batch_failed = []
+                for fut in as_completed(merge_futures):
+                    if interrupted:
+                        break
+                    try:
+                        action, rel_path, error = fut.result()
+                    except Exception as e:
+                        action, rel_path, error = "failed", "", str(e)
+
+                    actual_path = rel_path or merge_futures.get(fut, "")
+
+                    if action == "merged":
+                        depth_merged += 1
+                        batch_completed.append(actual_path)
+                    else:
+                        depth_failed += 1
+                        batch_failed.append(actual_path)
+                        if error:
+                            logger.warning(f"合并失败 {actual_path}: {error}")
+
+                    processed += 1
+                    if processed % batch_size == 0:
+                        _mark_tiles(db_conn, depth, batch_completed, "completed")
+                        _mark_tiles(db_conn, depth, batch_failed, "failed")
+                        db_conn.commit()
+                        batch_completed.clear()
+                        batch_failed.clear()
+                        logger.debug(
+                            f"[depth {depth}] 进度 {processed}/{total_pending}"
+                        )
+
+                if batch_completed:
+                    _mark_tiles(db_conn, depth, batch_completed, "completed")
+                if batch_failed:
+                    _mark_tiles(db_conn, depth, batch_failed, "failed")
+                if batch_completed or batch_failed:
+                    db_conn.commit()
+
+        # 检查最终状态
+        final_stats = _get_depth_stats(db_conn, depth)
+        if final_stats["failed"] > 0:
+            final_status = "in_progress"
+            logger.warning(
+                f"[depth {depth}] 有 {final_stats['failed']} 个失败 tile，"
+                f"状态保持 in_progress，下次运行将重试"
+            )
+        else:
+            final_status = "completed"
+
+        save_manifest(args.output_dir, depth, {
+            "depth": depth,
+            "status": final_status,
+            "total_tiles": len(tiles),
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
-        save_manifest(args.output_dir, depth, manifest)
 
         depth_elapsed = time.time() - depth_start
         logger.info(
@@ -481,6 +776,8 @@ def main():
         total_copied += depth_copied
         total_merged += depth_merged
         total_failed += depth_failed
+
+    db_conn.close()
 
     signal.signal(signal.SIGINT, original_handler)
 
